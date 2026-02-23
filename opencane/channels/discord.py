@@ -11,11 +11,13 @@ from loguru import logger
 from opencane.bus.events import OutboundMessage
 from opencane.bus.queue import MessageBus
 from opencane.channels.base import BaseChannel
+from opencane.channels.text_split import split_message
 from opencane.config.schema import DiscordConfig
 from opencane.utils.helpers import get_data_path
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
+MAX_MESSAGE_LEN = 2000  # Discord message character limit
 
 
 class DiscordChannel(BaseChannel):
@@ -78,33 +80,45 @@ class DiscordChannel(BaseChannel):
             return
 
         url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
-        payload: dict[str, Any] = {"content": msg.content}
-
-        if msg.reply_to:
-            payload["message_reference"] = {"message_id": msg.reply_to}
-            payload["allowed_mentions"] = {"replied_user": False}
-
         headers = {"Authorization": f"Bot {self.config.token}"}
 
         try:
-            for attempt in range(3):
-                try:
-                    response = await self._http.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        data = response.json()
-                        retry_after = float(data.get("retry_after", 1.0))
-                        logger.warning(f"Discord rate limited, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    response.raise_for_status()
-                    return
-                except Exception as e:
-                    if attempt == 2:
-                        logger.error(f"Error sending Discord message: {e}")
-                    else:
-                        await asyncio.sleep(1)
+            chunks = split_message(msg.content or "", max_len=MAX_MESSAGE_LEN)
+            if not chunks:
+                return
+
+            for i, chunk in enumerate(chunks):
+                payload: dict[str, Any] = {"content": chunk}
+
+                # Keep reply reference only on the first chunk.
+                if i == 0 and msg.reply_to:
+                    payload["message_reference"] = {"message_id": msg.reply_to}
+                    payload["allowed_mentions"] = {"replied_user": False}
+
+                if not await self._send_payload(url, headers, payload):
+                    break
         finally:
             await self._stop_typing(msg.chat_id)
+
+    async def _send_payload(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> bool:
+        """Send one Discord message payload with bounded retry on transient failures."""
+        for attempt in range(3):
+            try:
+                response = await self._http.post(url, headers=headers, json=payload)
+                if response.status_code == 429:
+                    data = response.json()
+                    retry_after = float(data.get("retry_after", 1.0))
+                    logger.warning(f"Discord rate limited, retrying in {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"Error sending Discord message: {e}")
+                else:
+                    await asyncio.sleep(1)
+        return False
 
     async def _gateway_loop(self) -> None:
         """Main gateway loop: identify, heartbeat, dispatch events."""
