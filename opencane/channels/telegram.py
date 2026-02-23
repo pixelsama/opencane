@@ -198,17 +198,35 @@ class TelegramChannel(BaseChannel):
             logger.error(f"Invalid chat_id: {msg.chat_id}")
             return
 
+        reply_to_message_id: int | None = None
+        if self.config.reply_to_message:
+            reply_to = msg.reply_to
+            if reply_to is None and msg.metadata:
+                reply_to = msg.metadata.get("message_id")
+            if reply_to is not None:
+                try:
+                    reply_to_message_id = int(reply_to)
+                except (TypeError, ValueError):
+                    logger.debug(f"Telegram reply_to is not a valid message id: {reply_to}")
+
         chunks = split_message(msg.content or "", max_len=MAX_TEXT_LENGTH)
         if not chunks:
             return
 
         for i, chunk in enumerate(chunks):
+            reply_kwargs: dict[str, int | bool] = {}
+            if i == 0 and reply_to_message_id is not None:
+                reply_kwargs = {
+                    "reply_to_message_id": reply_to_message_id,
+                    "allow_sending_without_reply": True,
+                }
             try:
                 html_content = _markdown_to_telegram_html(chunk)
                 await self._app.bot.send_message(
                     chat_id=chat_id,
                     text=html_content,
-                    parse_mode="HTML"
+                    parse_mode="HTML",
+                    **reply_kwargs,
                 )
             except Exception as e:
                 # Fallback to plain text if HTML parsing fails
@@ -216,7 +234,8 @@ class TelegramChannel(BaseChannel):
                 try:
                     await self._app.bot.send_message(
                         chat_id=chat_id,
-                        text=chunk
+                        text=chunk,
+                        **reply_kwargs,
                     )
                 except Exception as e2:
                     logger.error(f"Error sending Telegram chunk {i + 1}: {e2}")
