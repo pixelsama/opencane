@@ -123,6 +123,7 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
+        self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._register_default_tools()
 
     def _should_apply_safety(
@@ -400,6 +401,20 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
+    def _schedule_consolidation(self, session: Session, *, archive_all: bool = False) -> None:
+        """Start memory consolidation for a session, deduplicated by session key."""
+        if session.key in self._consolidating:
+            return
+        self._consolidating.add(session.key)
+
+        async def _run() -> None:
+            try:
+                await self._consolidate_memory(session, archive_all=archive_all)
+            finally:
+                self._consolidating.discard(session.key)
+
+        asyncio.create_task(_run())
+
     async def _build_prompt_memory_context(
         self,
         *,
@@ -640,12 +655,9 @@ class AgentLoop:
             self.sessions.save(session)
             self.sessions.invalidate(session.key)
 
-            async def _consolidate_and_cleanup():
-                temp_session = Session(key=session.key)
-                temp_session.messages = messages_to_archive
-                await self._consolidate_memory(temp_session, archive_all=True)
-
-            asyncio.create_task(_consolidate_and_cleanup())
+            temp_session = Session(key=session.key)
+            temp_session.messages = messages_to_archive
+            self._schedule_consolidation(temp_session, archive_all=True)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started. Memory consolidation in progress.")
         if cmd == "/help":
@@ -653,7 +665,7 @@ class AgentLoop:
                                   content="🦯 OpenCane commands:\n/new — Start a new conversation\n/help — Show available commands")
 
         if len(session.messages) > self.memory_window:
-            asyncio.create_task(self._consolidate_memory(session))
+            self._schedule_consolidation(session)
 
         self._set_tool_context(msg.channel, msg.chat_id)
         memory_context = await self._build_prompt_memory_context(
