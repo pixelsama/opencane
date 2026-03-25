@@ -3,13 +3,12 @@ Minimal QuecPython device client for OpenCane generic_mqtt adapter.
 
 This script targets EC600MCNLE and implements:
 1. MQTT connect + subscribe downlink topics
-2. Uplink control events: hello / heartbeat / listen_start / listen_stop
+2. Uplink control events: hello / heartbeat / listen_start / listen_stop / image_ready
 3. Uplink audio packet with 16-byte framed header
 4. GPIO button trigger for listen start/stop
-
-Notes:
-- Audio source is a demo stub. Replace DemoAudioSource.read() with real mic data.
-- Keep PACKET_MAGIC/topic names aligned with OpenCane runtime config.
+5. Optional real-media integration:
+   - Mic stream via audio.Record.stream_start/stream_read/stream_stop
+   - Camera snapshot via camera.camCapture (requires LCD init per QuecPython docs)
 """
 
 try:
@@ -31,6 +30,11 @@ except ImportError:
     import umqtt
 
     MQTTClient = umqtt.MQTTClient
+
+try:
+    import uos as os_mod
+except ImportError:
+    import os as os_mod
 
 
 # ===== Device + broker config (edit these first) =====
@@ -65,15 +69,50 @@ BUTTON_PIN = 12
 BUTTON_ACTIVE_LOW = True
 BUTTON_POLL_MS = 20
 
+# Audio source mode:
+# - "auto": prefer real mic stream, fallback to demo stream
+# - "real": require real mic stream, fail listen_start if unavailable
+# - "demo": always use fake audio stream
+AUDIO_SOURCE_MODE = "auto"
+AUDIO_RECORD_DEVICE = 0
+AUDIO_RECORD_FORMAT = "AMRNB"  # PCM / WAV / AMRNB / AMRWB / OGGOPUS
+AUDIO_RECORD_SAMPLE_RATE = 8000
+AUDIO_RECORD_READ_BYTES = 320
+
+# Optional camera snapshot support.
+# Notes:
+# - QuecPython camera docs require LCD initialization before camera usage.
+# - Leave CAMERA_ENABLED=False unless your board wiring/init is ready.
+CAMERA_ENABLED = False
+CAMERA_MODEL = 0
+CAMERA_SENSOR_WIDTH = 320
+CAMERA_SENSOR_HEIGHT = 240
+CAMERA_PREVIEW_LEVEL = 1
+CAMERA_LCD_WIDTH = 240
+CAMERA_LCD_HEIGHT = 320
+CAMERA_CAPTURE_WIDTH = 320
+CAMERA_CAPTURE_HEIGHT = 240
+CAMERA_CAPTURE_TIMEOUT_MS = 3000
+CAMERA_PICTURE_PREFIX = "/usr/opencane_img"
+
 
 class DemoAudioSource:
     """Simple fake audio source for smoke tests."""
+
+    name = "demo"
+    codec_name = "pcm_u8_demo"
 
     def __init__(self, frame_bytes=320, frame_interval_ms=40):
         self.frame_bytes = int(frame_bytes)
         self.frame_interval_ms = int(frame_interval_ms)
         self._last_sent_ms = 0
         self._tone = 0
+
+    def start(self):
+        return 0
+
+    def stop(self):
+        return 0
 
     def read(self):
         now = utime.ticks_ms()
@@ -82,6 +121,125 @@ class DemoAudioSource:
         self._last_sent_ms = now
         self._tone = (self._tone + 1) & 0xFF
         return bytes([self._tone]) * self.frame_bytes
+
+
+class RecordAudioSource:
+    """Real mic stream source based on QuecPython audio.Record API."""
+
+    name = "record_stream"
+
+    def __init__(
+        self,
+        device=0,
+        format_name="AMRNB",
+        sample_rate=8000,
+        read_bytes=320,
+    ):
+        import audio
+
+        self._audio = audio
+        self._rec = self._audio.Record(int(device))
+        self._format_name = str(format_name or "AMRNB").strip().upper()
+        self._format_code = self._resolve_format_code()
+        self.sample_rate = int(sample_rate)
+        self.read_bytes = max(64, int(read_bytes))
+        self._read_buf = bytearray(self.read_bytes)
+        self._running = False
+        self.codec_name = self._format_name.lower()
+
+    def _resolve_format_code(self):
+        if hasattr(self._rec, self._format_name):
+            return int(getattr(self._rec, self._format_name))
+        if hasattr(self._rec, "AMRNB"):
+            self._format_name = "AMRNB"
+            return int(getattr(self._rec, "AMRNB"))
+        raise ValueError("audio format not supported: {}".format(self._format_name))
+
+    def start(self):
+        if self._running:
+            return 0
+        # time=0 means continuous stream until stream_stop.
+        rc = self._rec.stream_start(self._format_code, self.sample_rate, 0)
+        if int(rc) != 0:
+            raise RuntimeError("record stream_start failed rc={}".format(rc))
+        self._running = True
+        return 0
+
+    def stop(self):
+        if not self._running:
+            return 0
+        rc = self._rec.stream_stop()
+        self._running = False
+        return int(rc)
+
+    def read(self):
+        if not self._running:
+            return None
+        n = self._rec.stream_read(self._read_buf, len(self._read_buf))
+        if isinstance(n, int) and n > 0:
+            return bytes(self._read_buf[: int(n)])
+        return None
+
+
+class CameraCaptureSource:
+    """Optional camera capture helper via camera.camCapture."""
+
+    name = "cam_capture"
+
+    def __init__(self):
+        import camera
+
+        self._camera = camera
+        self._capture = self._camera.camCapture(
+            int(CAMERA_MODEL),
+            int(CAMERA_SENSOR_WIDTH),
+            int(CAMERA_SENSOR_HEIGHT),
+            int(CAMERA_PREVIEW_LEVEL),
+            int(CAMERA_LCD_WIDTH),
+            int(CAMERA_LCD_HEIGHT),
+        )
+        self._capture_result = None
+        self._opened = False
+        self._capture.callback(self._on_capture)
+
+    def _on_capture(self, result_list):
+        self._capture_result = result_list
+
+    def open(self):
+        if self._opened:
+            return 0
+        rc = self._capture.open()
+        if int(rc) == 0:
+            self._opened = True
+        return int(rc)
+
+    def close(self):
+        if not self._opened:
+            return 0
+        rc = self._capture.close()
+        self._opened = False
+        return int(rc)
+
+    def capture(self, picture_name_no_ext):
+        if not self._opened:
+            rc = self.open()
+            if int(rc) != 0:
+                raise RuntimeError("camera open failed rc={}".format(rc))
+        self._capture_result = None
+        rc = self._capture.start(int(CAMERA_CAPTURE_WIDTH), int(CAMERA_CAPTURE_HEIGHT), picture_name_no_ext)
+        if int(rc) != 0:
+            raise RuntimeError("camera start failed rc={}".format(rc))
+
+        start_ms = utime.ticks_ms()
+        while utime.ticks_diff(utime.ticks_ms(), start_ms) < int(CAMERA_CAPTURE_TIMEOUT_MS):
+            if self._capture_result is not None:
+                result = self._capture_result
+                state = int(result[0]) if isinstance(result, (list, tuple)) and result else -1
+                if state == 0 and len(result) > 1:
+                    return str(result[1])
+                break
+            utime.sleep_ms(50)
+        return "{}.jpeg".format(picture_name_no_ext)
 
 
 class OpenCaneEC600Client:
@@ -94,7 +252,41 @@ class OpenCaneEC600Client:
         self.last_heartbeat_ms = 0
         self.button = self._init_button(BUTTON_PIN)
         self.prev_pressed = self._is_button_pressed()
-        self.audio_source = DemoAudioSource()
+        self.audio_source = self._build_audio_source()
+        self.camera_source = self._build_camera_source()
+        print(
+            "[init] audio_source={} codec={} camera={}".format(
+                getattr(self.audio_source, "name", "unknown"),
+                getattr(self.audio_source, "codec_name", "unknown"),
+                "on" if self.camera_source is not None else "off",
+            )
+        )
+
+    def _build_audio_source(self):
+        mode = str(AUDIO_SOURCE_MODE or "auto").strip().lower()
+        if mode == "demo":
+            return DemoAudioSource()
+        try:
+            return RecordAudioSource(
+                device=AUDIO_RECORD_DEVICE,
+                format_name=AUDIO_RECORD_FORMAT,
+                sample_rate=AUDIO_RECORD_SAMPLE_RATE,
+                read_bytes=AUDIO_RECORD_READ_BYTES,
+            )
+        except Exception as exc:
+            if mode == "real":
+                raise
+            print("[audio] fallback to demo source:", exc)
+            return DemoAudioSource()
+
+    def _build_camera_source(self):
+        if not CAMERA_ENABLED:
+            return None
+        try:
+            return CameraCaptureSource()
+        except Exception as exc:
+            print("[camera] init failed, camera disabled:", exc)
+            return None
 
     def _init_button(self, pin_num):
         mode_in = getattr(Pin, "IN", 0)
@@ -149,6 +341,36 @@ class OpenCaneEC600Client:
         self.client.publish(TOPIC_UP_CONTROL, body, qos=CONTROL_QOS)
         return env
 
+    def _safe_file_size(self, path):
+        try:
+            return int(os_mod.stat(path)[6])
+        except Exception:
+            return -1
+
+    def _capture_image_and_report(self, trigger):
+        if self.camera_source is None:
+            self._publish_control("image_ready", {"ok": False, "error": "camera_disabled", "trigger": trigger})
+            print("[up/control] image_ready camera_disabled")
+            return
+        stem = "{}_{}".format(CAMERA_PICTURE_PREFIX, self._now_ms())
+        try:
+            pic_path = self.camera_source.capture(stem)
+        except Exception as exc:
+            self._publish_control(
+                "image_ready",
+                {"ok": False, "error": str(exc), "trigger": trigger, "path": "{}.jpeg".format(stem)},
+            )
+            print("[up/control] image_ready failed:", exc)
+            return
+        payload = {
+            "ok": True,
+            "path": pic_path,
+            "size": self._safe_file_size(pic_path),
+            "trigger": trigger,
+        }
+        self._publish_control("image_ready", payload)
+        print("[up/control] image_ready path={} size={}".format(pic_path, payload["size"]))
+
     def _build_audio_packet(self, seq, timestamp_ms, audio_bytes):
         data = audio_bytes if isinstance(audio_bytes, (bytes, bytearray)) else b""
         header = bytearray(16)
@@ -188,6 +410,16 @@ class OpenCaneEC600Client:
         print("[down/control] type={}".format(cmd_type))
         if cmd_type == "close" and self.listening:
             self._send_listen_stop(reason="server_close")
+            return
+        if cmd_type in ("debug_listen_start", "listen_start"):
+            self._send_listen_start(trigger="remote")
+            return
+        if cmd_type in ("debug_listen_stop", "listen_stop"):
+            self._send_listen_stop(reason="remote")
+            return
+        if cmd_type in ("capture_image", "debug_capture_image"):
+            self._capture_image_and_report(trigger="remote")
+            return
 
     def connect(self):
         username = MQTT_USERNAME or None
@@ -234,16 +466,29 @@ class OpenCaneEC600Client:
     def _send_listen_start(self, trigger):
         if self.listening:
             return
+        try:
+            self.audio_source.start()
+        except Exception as exc:
+            self._publish_control(
+                "error",
+                {"stage": "listen_start", "error": str(exc), "trigger": trigger},
+            )
+            print("[audio] start failed:", exc)
+            return
         self._new_session_id()
         self.listen_chunk_count = 0
         self.listening = True
-        payload = {"trigger": trigger, "codec": "opus"}
+        payload = {"trigger": trigger, "codec": getattr(self.audio_source, "codec_name", "unknown")}
         self._publish_control("listen_start", payload)
         print("[up/control] listen_start sid={}".format(self.session_id))
 
     def _send_listen_stop(self, reason):
         if not self.listening:
             return
+        try:
+            self.audio_source.stop()
+        except Exception as exc:
+            print("[audio] stop failed:", exc)
         payload = {"reason": reason, "chunks": self.listen_chunk_count}
         self._publish_control("listen_stop", payload)
         print("[up/control] listen_stop sid={} chunks={}".format(self.session_id, self.listen_chunk_count))
@@ -282,6 +527,15 @@ class OpenCaneEC600Client:
                     utime.sleep_ms(BUTTON_POLL_MS)
             except Exception as exc:
                 print("[runtime] error:", exc)
+                try:
+                    self.audio_source.stop()
+                except Exception:
+                    pass
+                if self.camera_source is not None:
+                    try:
+                        self.camera_source.close()
+                    except Exception:
+                        pass
                 self.disconnect()
                 utime.sleep_ms(RECONNECT_DELAY_MS)
 
