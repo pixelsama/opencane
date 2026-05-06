@@ -20,39 +20,44 @@ Reverse mapping:
 
 from __future__ import annotations
 
-import asyncio
 import base64
+import json
 import logging
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
-from opencane.hardware.adapter.base import GatewayAdapter
-from opencane.hardware.protocol import (
-    CanonicalEnvelope,
-    DeviceEventType,
-    make_event,
-)
+from websockets.legacy.server import WebSocketServerProtocol
+
+from opencane.hardware.adapter.websocket_adapter import WebSocketAdapter
+from opencane.hardware.protocol import CanonicalEnvelope, DeviceEventType, make_event
 
 log = logging.getLogger(__name__)
 
-_SENTINEL = object()
 
-
-class LegacyWebSocketAdapter(GatewayAdapter):
+class LegacyWebSocketAdapter(WebSocketAdapter):
     """
     Adapter for legacy hardware using old WebSocket protocol.
 
-    Inherits from GatewayAdapter and implements protocol translation.
+    Extends WebSocketAdapter with protocol translation for old blind cane hardware.
+    Implements message conversion between old and canonical protocols.
     """
 
     name = "legacy_demo"
     transport = "ws_legacy"
 
     def __init__(self, config: dict[str, Any]):
+        # Initialize parent WebSocket adapter
+        super().__init__(
+            host=config.get("host", "0.0.0.0"),
+            port=config.get("port", 18791),
+            require_token=config.get("require_token", False),
+            token=config.get("token", ""),
+            packet_magic=config.get("packet_magic", 0xA1),
+        )
+        
         self.device_id = config.get("device_id", "legacy-device-001")
         self.session_map = {}  # Maps old session_id -> canonical session_id
         self.response_create_consumed = set()  # Track response.create messages
-        self._running = False
-        self._queue: asyncio.Queue[CanonicalEnvelope | object] = asyncio.Queue()
 
         # Event type aliases: old name -> canonical name
         self._event_type_aliases = {
@@ -71,34 +76,67 @@ class LegacyWebSocketAdapter(GatewayAdapter):
             "tts_stop": "response.audio.done",
         }
 
-    async def start(self):
-        """Initialize adapter."""
-        self._running = True
-        log.info(f"[{self.name}] Adapter started")
+    async def _handle_connection(self, websocket: WebSocketServerProtocol, path: str) -> None:
+        """Override parent handler to add legacy protocol translation."""
+        # Parse query parameters (may be empty for legacy clients)
+        query = parse_qs(urlparse(path).query)
+        device_id = (query.get("device_id") or query.get("device-id") or [""])[0]
+        session_id = (query.get("session_id") or query.get("session-id") or [""])[0]
 
-    async def stop(self):
-        """Shutdown adapter."""
-        self._running = False
-        await self._queue.put(_SENTINEL)
-        log.info(f"[{self.name}] Adapter stopped")
+        # Use config device_id if not provided in query params
+        if not device_id:
+            device_id = self.device_id
 
-    async def recv_events(self):
-        """Receive events from queue and yield to runtime."""
-        while self._running:
-            try:
-                item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-                if item is _SENTINEL:
-                    break
-                yield item
-            except asyncio.TimeoutError:
-                continue
+        # Track if we've stored the socket
+        stored_device = False
+        stored_session = False
+
+        try:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    # Handle binary audio (pass through to parent)
+                    continue
+
+                # Parse JSON message
+                try:
+                    old_msg = json.loads(message)
+                except json.JSONDecodeError:
+                    log.warning(f"[{self.name}] Failed to parse JSON: {message}")
+                    continue
+
+                # Extract device_id and session_id from message if not yet known
+                msg_device_id = old_msg.get("device_id", device_id)
+                msg_session_id = old_msg.get("session_id", session_id)
+
+                # Store socket on first message (now we know the device/session IDs)
+                if not stored_device and msg_device_id:
+                    self._device_sockets[msg_device_id] = websocket
+                    stored_device = True
+                    device_id = msg_device_id
+
+                if not stored_session and msg_device_id and msg_session_id:
+                    self._session_sockets[(msg_device_id, msg_session_id)] = websocket
+                    stored_session = True
+                    session_id = msg_session_id
+
+                # Translate old protocol to canonical
+                canonical = self.inject_event(old_msg)
+                if canonical:
+                    await self._queue.put(canonical)
+        except Exception as e:
+            log.error(f"[{self.name}] Connection error: {e}")
+        finally:
+            # Cleanup
+            if stored_device and device_id in self._device_sockets:
+                del self._device_sockets[device_id]
+            if stored_session and (device_id, session_id) in self._session_sockets:
+                del self._session_sockets[(device_id, session_id)]
 
     async def send_command(self, cmd: CanonicalEnvelope) -> None:
         """
         Send command to hardware (translate from canonical to old protocol).
 
-        For demo purposes, we log the command.
-        In a real scenario, this would send via WebSocket.
+        Overrides parent to add legacy protocol translation before sending.
         """
         old_type = self._command_type_aliases.get(cmd.type, cmd.type)
 
@@ -114,6 +152,20 @@ class LegacyWebSocketAdapter(GatewayAdapter):
 
         log.info(f"[{self.name}] send_command: canonical={cmd.type} → old={old_type}")
         log.debug(f"[{self.name}] Message: {old_msg}")
+
+        # Send via parent's WebSocket infrastructure
+        ws = self._session_sockets.get((cmd.device_id, cmd.session_id))
+        if ws is None:
+            ws = self._device_sockets.get(cmd.device_id)
+        if ws is None:
+            log.warning(
+                f"[{self.name}] Cannot find socket for {cmd.device_id}/{cmd.session_id}"
+            )
+            return
+        try:
+            await ws.send(json.dumps(old_msg, ensure_ascii=False))
+        except Exception as e:
+            log.warning(f"[{self.name}] Failed to send command: {e}")
 
     def _translate_session_update(self, old_msg: dict[str, Any]) -> CanonicalEnvelope:
         """Translate session.update → hello."""
@@ -238,8 +290,6 @@ class LegacyWebSocketAdapter(GatewayAdapter):
             return None
 
         if canonical_event:
-            # Queue the event for runtime
-            asyncio.create_task(self._queue.put(canonical_event))
             log.debug(f"[{self.name}] Queued: {canonical_type} (seq={old_msg.get('seq')})")
 
         return canonical_event
