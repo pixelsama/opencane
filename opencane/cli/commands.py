@@ -1313,7 +1313,7 @@ def hardware_serve(
     adapter: str | None = typer.Option(
         None,
         "--adapter",
-        help="Adapter override: websocket/mock/ec600/generic_mqtt",
+        help="Adapter override: websocket/mock/ec600/generic_mqtt/legacy_demo",
     ),
     host: str | None = typer.Option(None, "--host", help="Hardware adapter host override"),
     port: int | None = typer.Option(None, "--port", help="Hardware adapter port override"),

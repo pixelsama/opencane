@@ -11,6 +11,7 @@ from opencane.hardware.adapter.ec600_adapter import EC600Adapter, EC600MQTTAdapt
 from opencane.hardware.adapter.generic_mqtt_adapter import GenericMQTTAdapter
 from opencane.hardware.adapter.mock_adapter import MockAdapter
 from opencane.hardware.adapter.websocket_adapter import WebSocketAdapter
+from opencane.hardware.adapter.legacy_websocket_adapter import LegacyWebSocketAdapter
 
 __all__ = [
     "GatewayAdapter",
@@ -23,4 +24,5 @@ __all__ = [
     "list_generic_mqtt_profiles",
     "build_generic_mqtt_runtime",
     "WebSocketAdapter",
+    "LegacyWebSocketAdapter",
 ]

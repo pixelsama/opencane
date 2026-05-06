@@ -1353,6 +1353,9 @@ def create_adapter_from_config(config: HardwareConfig) -> GatewayAdapter:
             packet_magic=packet_magic,
             audio_up_mode=audio_mode,
         )
+    if adapter_name == "legacy_demo":
+        from opencane.hardware.adapter.legacy_websocket_adapter import LegacyWebSocketAdapter
+        return LegacyWebSocketAdapter(config={"device_id": "legacy-device-001"})
     return WebSocketAdapter(
         host=config.host,
         port=config.port,
